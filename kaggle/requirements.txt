@@ -1,0 +1,9 @@
+# Kaggle-side training deps (T4).
+torch
+diffusers
+peft
+accelerate
+transformers
+pillow
+numpy
+pytesseract
