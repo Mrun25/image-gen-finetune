@@ -1,22 +1,28 @@
 """Qwen-Image-2.1-Turbo LoRA trainer (free-T4 recipe).
 
-Recipe proven in a private Kaggle smoke test (peak 4.8GB on a T4): 4bit nf4
-transformer+text_encoder, PEFT LoRA r16 on attention projections,
+Base recipe proven in a private Kaggle smoke test (peak 4.8GB on a T4):
+4bit nf4 transformer+text_encoder, PEFT LoRA r16 on attention projections,
 flow-matching loss on the Turbo checkpoint's own saved sigmas, gradient
 checkpointing, batch 1.
 
-On top of the smoke recipe:
+On top of the smoke recipe (see docs/model-evolution.md for sources):
 - data from synth_posters.py (per-image captions via metadata.jsonl)
 - two-phase curriculum: phase 1 trains stage-1 (clean) data, phase 2 trains
-  stage-1+stage-2 mixed (see docs/modern-image-models.md)
+  stage-1+stage-2 mixed
+- Min-SNR-style loss weighting across noise levels (--min-snr-gamma, 0=off)
+- EMA of LoRA weights; EMA copy is saved and used for eval (--ema-decay, 0=off)
+- mid-sigma sampling bias (flag --no-sigma-bias to sample uniformly)
+- linear warmup + cosine LR decay (--warmup)
 - base-vs-LoRA comparison sheet on held-out prompts
 
 Run ON Kaggle (GPU T4 x2, internet on) via kaggle/runner.ipynb, which installs
 deps first. Not meant for local CPU.
 """
 import argparse
+import copy
 import gc
 import json
+import math
 import random
 from pathlib import Path
 
@@ -48,6 +54,10 @@ def main():
     ap.add_argument("--height", type=int, default=512)
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--warmup", type=int, default=25)
+    ap.add_argument("--min-snr-gamma", type=float, default=5.0)
+    ap.add_argument("--ema-decay", type=float, default=0.999)
+    ap.add_argument("--no-sigma-bias", action="store_true")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -76,6 +86,9 @@ def main():
     if sigmas is None:
         sigmas = list(np.linspace(1.0, 1 / 8, 8))
     SIGMAS = [float(s) for s in sigmas]
+    # mid-sigma bias: down-weight near-pure-noise and near-clean steps
+    mid = (len(SIGMAS) - 1) / 2
+    SIGMA_W = [1.0 / (1.0 + abs(i - mid)) for i in range(len(SIGMAS))]
     print("vae_scale", F, "sigmas", SIGMAS, flush=True)
 
     # ---- precompute caption embeddings ----
@@ -116,8 +129,30 @@ def main():
     tr = get_peft_model(tr, cfg)
     tr.print_trainable_parameters()
     tr = tr.to("cuda")
-    opt = torch.optim.AdamW([p for p in tr.parameters() if p.requires_grad],
-                            lr=args.lr, weight_decay=0.0)
+    trainable = [p for p in tr.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
+
+    ema = {i: p.detach().clone() for i, p in enumerate(trainable)} if args.ema_decay > 0 else None
+
+    total_steps = args.steps1 + args.steps2
+    gstep = [0]
+
+    def lr_mult():
+        s = gstep[0] + 1
+        w = min(1.0, s / max(1, args.warmup))
+        prog = min(1.0, s / max(1, total_steps))
+        return w * (0.1 + 0.45 * (1 + math.cos(math.pi * prog)))
+
+    def pick_sigma():
+        if args.no_sigma_bias:
+            return random.choice(SIGMAS)
+        return random.choices(SIGMAS, weights=SIGMA_W, k=1)[0]
+
+    def snr_weight(s):
+        if args.min_snr_gamma <= 0:
+            return 1.0
+        snr = ((1.0 - s) / max(s, 1e-5)) ** 2
+        return min(snr, args.min_snr_gamma) / snr
 
     IMGS = [[(1, LH, LW)]]
     hist = []
@@ -132,7 +167,7 @@ def main():
             IM = torch.cat([torch.zeros(1, pe.shape[1], dtype=torch.bool),
                             torch.ones(1, L // 4, dtype=torch.bool)], dim=1).to("cuda")
             noise = torch.randn_like(lat)
-            s = random.choice(SIGMAS)
+            s = pick_sigma()
             xt = (1.0 - s) * lat + s * noise
             tgt = noise - lat
             ts = torch.tensor([s], device="cuda", dtype=torch.bfloat16)
@@ -140,10 +175,17 @@ def main():
                       encoder_hidden_states_mask=pm, img_shapes=IMGS, img_mask=IM,
                       return_dict=False)[0]
             pred = pred[:, -lat.shape[1]:]
-            loss = Fn.mse_loss(pred.float(), tgt.float())
+            loss = snr_weight(s) * Fn.mse_loss(pred.float(), tgt.float())
             loss.backward()
+            for g in opt.param_groups:
+                g["lr"] = args.lr * lr_mult()
             opt.step()
             opt.zero_grad(set_to_none=True)
+            gstep[0] += 1
+            if ema is not None:
+                with torch.no_grad():
+                    for j, p in enumerate(trainable):
+                        ema[j].mul_(args.ema_decay).add_(p.detach(), alpha=1 - args.ema_decay)
             if step == 1 or step % 25 == 0:
                 peak = torch.cuda.max_memory_allocated() / 2 ** 30
                 print(f"{tag} step {step}/{steps} loss {loss.item():.4f} peak {peak:.1f}GB", flush=True)
@@ -155,12 +197,19 @@ def main():
 
     (out / "lora").mkdir(exist_ok=True)
     tr.save_pretrained(str(out / "lora"))
-    json.dump({"hist": hist, "peak_gb": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)},
+    if ema is not None:
+        # swap EMA weights in, save a second copy, keep EMA active for eval
+        with torch.no_grad():
+            for j, p in enumerate(trainable):
+                p.copy_(ema[j].to(p.device, p.dtype))
+        tr.save_pretrained(str(out / "lora_ema"))
+        print("EMA copy saved to lora_ema (used for eval)", flush=True)
+    json.dump({"hist": hist, "peak_gb": round(torch.cuda.max_memory_allocated() / 2 ** 30, 2),
+               "args": vars(args)},
               open(out / "train_log.json", "w"))
     print("TRAIN OK peak GB", round(torch.cuda.max_memory_allocated() / 2 ** 30, 2), flush=True)
 
     # ---- eval: base vs LoRA on held-out prompts ----
-    from diffusers import FlowMatchEulerDiscreteScheduler
     del opt
     gc.collect()
     torch.cuda.empty_cache()
